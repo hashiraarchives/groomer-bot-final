@@ -105,6 +105,7 @@ class DogAnalysis(BaseModel):
     size: Literal["Small", "Medium", "Large"]
     estimated_duration_minutes: int
     coat_condition: str
+    friendly_comment: str = ""
 
 
 class UserState(str, Enum):
@@ -422,38 +423,38 @@ async def analyze_dog_image(image_url: str) -> Optional[DogAnalysis]:
     Returns:
         DogAnalysis result or None if failed
     """
+    import httpx
+    import base64
+
     configure_gemini()
 
-    # Use Gemini 2.0 Flash (latest available vision model)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    # Use Gemini 2.5 Flash (latest model with vision)
+    model = genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
 
-    prompt = """Analyze this dog image and return ONLY a JSON object:
+    prompt = """You're a friendly pet grooming expert. Analyze this dog photo and return ONLY a JSON object (no markdown, no extra text):
+
 {
-    "breed": "<detected breed>",
+    "breed": "<your best guess at the breed or mix>",
     "size": "<exactly one of: Small, Medium, Large>",
     "estimated_duration_minutes": <integer>,
-    "coat_condition": "<normal/matted/tangled/well-maintained>"
+    "coat_condition": "<describe the coat: normal, matted, tangled, fluffy, well-maintained, needs brushing, etc.>",
+    "friendly_comment": "<a warm, personalized 1-sentence comment about this specific dog>"
 }
 
 Size guidelines:
-- Small: under 10kg (Chihuahua, Pomeranian, etc.)
-- Medium: 10-25kg (Beagle, Cocker Spaniel, etc.)
-- Large: over 25kg (Golden Retriever, German Shepherd, etc.)
+- Small: under 10kg (Chihuahua, Pomeranian, Shih Tzu, etc.)
+- Medium: 10-25kg (Beagle, Cocker Spaniel, Border Collie, etc.)
+- Large: over 25kg (Golden Retriever, German Shepherd, Labrador, etc.)
 
-Duration guidelines:
-- Small: 60 min base
-- Medium: 90 min base
-- Large: 120 min base
-- Add 30 min if matted/tangled
+Grooming duration:
+- Small: 60 min | Medium: 90 min | Large: 120 min
+- Add 30 min if coat looks matted or tangled
 
-Return ONLY the JSON, no markdown or extra text."""
+Return ONLY valid JSON, nothing else."""
 
     try:
-        # Fetch image from URL and send to Gemini
-        import httpx
-
+        # Fetch image from Twilio (requires authentication)
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Twilio requires authentication to fetch media
             response = await client.get(
                 image_url,
                 auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -461,12 +462,26 @@ Return ONLY the JSON, no markdown or extra text."""
             response.raise_for_status()
             image_bytes = response.content
 
-        # Create image part
-        image_part = {"mime_type": "image/jpeg", "data": image_bytes}
+        # Detect mime type from response or default to jpeg
+        content_type = response.headers.get("content-type", "image/jpeg")
+        if ";" in content_type:
+            content_type = content_type.split(";")[0].strip()
+
+        logger.info(f"Downloaded image: {len(image_bytes)} bytes, type: {content_type}")
+
+        # Create image part in correct format for google-generativeai SDK
+        image_part = {
+            "inline_data": {
+                "mime_type": content_type,
+                "data": base64.b64encode(image_bytes).decode("utf-8")
+            }
+        }
 
         # Generate analysis
         result = model.generate_content([prompt, image_part])
         text = result.text.strip()
+
+        logger.info(f"Gemini response: {text[:200]}")
 
         # Clean markdown if present
         if text.startswith("```"):
@@ -479,7 +494,8 @@ Return ONLY the JSON, no markdown or extra text."""
             breed=data["breed"],
             size=data["size"],
             estimated_duration_minutes=data["estimated_duration_minutes"],
-            coat_condition=data["coat_condition"]
+            coat_condition=data["coat_condition"],
+            friendly_comment=data.get("friendly_comment", "")
         )
 
     except json.JSONDecodeError as e:
@@ -500,22 +516,20 @@ async def handle_image(phone: str, media_url: str) -> str:
 
     if not analysis:
         return (
-            "Sorry, I couldn't see the dog clearly.\n\n"
-            "Please send another photo with:\n"
-            "- Good lighting\n"
-            "- Full dog visible\n"
-            "- Clear, non-blurry image"
+            "Hmm, I'm having trouble seeing your pup clearly in that photo! 🐕\n\n"
+            "Could you send me another one? A well-lit shot where I can see "
+            "the whole dog works best!"
         )
 
     slot = get_next_available_slot(analysis.estimated_duration_minutes)
 
     if not slot:
+        comment = f" {analysis.friendly_comment}" if analysis.friendly_comment else ""
         return (
-            f"I found a {analysis.size.lower()} {analysis.breed}!\n\n"
-            f"Duration: {analysis.estimated_duration_minutes} min\n"
-            f"Coat: {analysis.coat_condition}\n\n"
-            "Unfortunately, we're fully booked for 2 weeks. "
-            "Please try again later."
+            f"Oh, what a lovely {analysis.breed}!{comment}\n\n"
+            f"I'd estimate about {analysis.estimated_duration_minutes} minutes for a full groom.\n\n"
+            "Unfortunately, we're completely booked for the next couple of weeks 😔 "
+            "Send me another photo anytime and I'll check again!"
         )
 
     # Update session
@@ -529,20 +543,31 @@ async def handle_image(phone: str, media_url: str) -> str:
     # Calculate price
     prices = {"Small": 50, "Medium": 70, "Large": 90}
     price = prices[analysis.size]
+    extra = 0
     if "matted" in analysis.coat_condition.lower():
-        price += 20
+        extra = 20
+        price += extra
 
     date_str = slot.strftime("%A, %d %B")
     time_str = slot.strftime("%I:%M %p")
 
+    # Build friendly response
+    comment = analysis.friendly_comment if analysis.friendly_comment else f"What a beautiful {analysis.breed}!"
+
+    price_note = f"${price}"
+    if extra:
+        price_note = f"${price} (includes ${extra} for coat care)"
+
     return (
-        f"Great! I analyzed your {analysis.breed}!\n\n"
-        f"Size: {analysis.size}\n"
-        f"Coat: {analysis.coat_condition}\n"
-        f"Duration: {analysis.estimated_duration_minutes} min\n"
-        f"Price: ${price}\n\n"
-        f"Next slot: {date_str} at {time_str}\n\n"
-        "Reply *Yes* to confirm or *No* to cancel."
+        f"{comment}\n\n"
+        f"Here's what I'm thinking:\n"
+        f"• Breed: {analysis.breed}\n"
+        f"• Size: {analysis.size}\n"
+        f"• Coat: {analysis.coat_condition}\n"
+        f"• Time needed: ~{analysis.estimated_duration_minutes} mins\n"
+        f"• Price: {price_note}\n\n"
+        f"I have an opening on *{date_str}* at *{time_str}* - does that work for you?\n\n"
+        "Just reply *Yes* to book it, or *No* if you'd like to pass!"
     )
 
 
@@ -553,7 +578,7 @@ def handle_text(phone: str, text: str) -> str:
 
     # Handle confirmation state
     if session.state == UserState.AWAITING_CONFIRMATION:
-        if text_lower in ["yes", "y", "confirm", "ok", "sure"]:
+        if text_lower in ["yes", "y", "confirm", "ok", "sure", "yep", "yeah", "book", "book it"]:
             if session.dog_analysis and session.proposed_slot:
                 booking = BookingDetails(
                     phone=phone,
@@ -570,61 +595,77 @@ def handle_text(phone: str, text: str) -> str:
                     reset_session(phone)
 
                     return (
-                        "Confirmed!\n\n"
-                        f"Date: {date_str}\n"
-                        f"Time: {time_str}\n"
-                        f"Dog: {booking.breed}\n\n"
-                        "Please arrive 10 min early.\n"
-                        "See you soon!"
+                        f"Awesome, you're all set! 🎉\n\n"
+                        f"📅 {date_str}\n"
+                        f"⏰ {time_str}\n"
+                        f"🐕 {booking.breed} grooming session\n\n"
+                        f"Just pop in about 10 minutes early so we can get started on time. "
+                        f"Can't wait to pamper your pup! See you then! 💈"
                     )
                 else:
                     reset_session(phone)
-                    return "Booking failed. Please try again or contact us directly."
+                    return (
+                        "Oh no, something went wrong on my end! 😅\n\n"
+                        "Could you try sending the photo again? Or feel free to give us a call directly."
+                    )
 
             reset_session(phone)
-            return "Session expired. Please send a photo to start again."
+            return (
+                "Oops, looks like we lost track of our conversation!\n\n"
+                "No worries - just send me a photo of your dog and we'll start fresh 📸"
+            )
 
-        elif text_lower in ["no", "n", "cancel", "nope"]:
+        elif text_lower in ["no", "n", "cancel", "nope", "nah", "not now", "maybe later"]:
             reset_session(phone)
-            return "Cancelled. Send a photo anytime to book again."
+            return (
+                "No problem at all! 👍\n\n"
+                "Whenever you're ready, just send me a photo of your furry friend "
+                "and we'll find a time that works better!"
+            )
 
         else:
-            return "Reply *Yes* to confirm or *No* to cancel."
+            return (
+                "Just checking - did you want to book that slot?\n\n"
+                "Reply *Yes* to confirm, or *No* to skip!"
+            )
 
     # Default state - handle general messages
-    greetings = ["hi", "hello", "hey"]
+    greetings = ["hi", "hello", "hey", "hiya", "good morning", "good afternoon", "good evening"]
     if any(g in text_lower for g in greetings):
         return (
-            "Welcome to Pet Grooming!\n\n"
-            "Send a photo of your dog and I'll:\n"
-            "- Identify the breed\n"
-            "- Estimate grooming time\n"
-            "- Find available slots\n\n"
-            "Ready when you are!"
+            "Hey there! 👋 Welcome to Pawsome Grooming!\n\n"
+            "I'm here to help you book a grooming session for your pup. "
+            "Just snap a photo of your dog and send it over - I'll take care of the rest!\n\n"
+            "I can figure out the breed, estimate how long the session will take, "
+            "and find you the next available slot. Easy peasy! 🐕"
         )
 
-    if "price" in text_lower or "cost" in text_lower:
+    if "price" in text_lower or "cost" in text_lower or "how much" in text_lower:
         return (
-            "Our Prices:\n\n"
-            "Small dogs: from $50\n"
-            "Medium dogs: from $70\n"
-            "Large dogs: from $90\n\n"
-            "Send a photo for exact quote!"
+            "Great question! Here's a rough guide:\n\n"
+            "🐕 Small pups (under 10kg): from $50\n"
+            "🐕 Medium dogs (10-25kg): from $70\n"
+            "🐕 Large doggos (25kg+): from $90\n\n"
+            "The exact price depends on coat condition and breed. "
+            "Send me a photo and I'll give you a proper quote!"
         )
 
-    if "help" in text_lower:
+    if "help" in text_lower or "how does" in text_lower or "how do" in text_lower:
         return (
-            "How it works:\n\n"
-            "1. Send a dog photo\n"
-            "2. I'll analyze breed & size\n"
-            "3. Get price & available time\n"
-            "4. Reply Yes to book!\n\n"
-            "Questions? Call +65 1234 5678"
+            "Happy to help! Here's how this works:\n\n"
+            "1️⃣ Send me a photo of your dog\n"
+            "2️⃣ I'll identify the breed and check the coat\n"
+            "3️⃣ You'll get a price and available time slots\n"
+            "4️⃣ Reply Yes to book - done!\n\n"
+            "It's that simple! Got questions? Call us at +65 1234 5678"
         )
+
+    if "thank" in text_lower:
+        return "You're welcome! 😊 Have a great day, and give your pup a pat from me! 🐕"
 
     return (
-        "Send a photo of your dog to book a grooming appointment!\n\n"
-        "I'll analyze the breed and find available slots."
+        "I'd love to help you book a grooming session!\n\n"
+        "Just send me a photo of your dog and I'll check what slots are available. 📸🐕"
     )
 
 
