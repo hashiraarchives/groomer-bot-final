@@ -1,876 +1,360 @@
 """
-Pet Grooming WhatsApp Bot - Twilio + Gemini + Google Calendar
+Pet Grooming WhatsApp Bot (AI Agent Version)
 ==============================================================
-
-A FastAPI-based WhatsApp bot for pet grooming appointments using:
-- Twilio for WhatsApp messaging
-- Google Gemini 2.0 Flash for dog image analysis
-- Google Calendar API for appointment scheduling
+Stack: FastAPI + Twilio + Gemini 2.0 Flash (Multimodal) + Google Calendar
+Features:
+- "One Brain" Logic: No rigid state machines; the AI decides flow.
+- Native Function Calling: AI calls calendar tools naturally.
+- Multimodal: Understands Text, Images (Dogs), and Audio (Voice Notes).
 
 Author: Senior Python Backend Engineer
-Version: 2.0.0
+Version: 3.0.0
 """
 
 import os
 import json
 import logging
+import base64
+import httpx
 from datetime import datetime, timedelta
-from typing import Optional, Literal
-from enum import Enum
+from typing import Optional, Dict, Any, List
 from zoneinfo import ZoneInfo
+from functools import partial
 
 from fastapi import FastAPI, Form, Request, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
-from twilio.rest import Client as TwilioClient
-from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
+from twilio.request_validator import RequestValidator
+
 import google.generativeai as genai
 from google.oauth2 import service_account
-from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-"""
-REQUIRED ENVIRONMENT VARIABLES:
--------------------------------
-1. GEMINI_API_KEY
-   - Get from: https://aistudio.google.com/app/apikey
 
-2. TWILIO_ACCOUNT_SID
-   - Get from: https://console.twilio.com (Account Info section)
-
-3. TWILIO_AUTH_TOKEN
-   - Get from: https://console.twilio.com (Account Info section)
-
-4. TWILIO_WHATSAPP_NUMBER
-   - Your Twilio WhatsApp number (format: whatsapp:+14155238886)
-   - Set up at: https://console.twilio.com/us1/develop/sms/try-it-out/whatsapp-learn
-
-5. GOOGLE_CALENDAR_ID
-   - Use 'primary' for default calendar or specific calendar ID
-
-GOOGLE CALENDAR CREDENTIALS:
-----------------------------
-Option A: Service Account (Recommended for Production)
-1. Go to Google Cloud Console > APIs & Services > Credentials
-2. Create Service Account > Download JSON key
-3. Rename to 'service_account.json' and place in project root
-4. Share your calendar with the service account email
-
-Option B: OAuth 2.0 (For Development)
-1. Go to Google Cloud Console > APIs & Services > Credentials
-2. Create OAuth 2.0 Client ID (Desktop app)
-3. Download and rename to 'credentials.json'
-4. First run will open browser for authorization
-"""
-
-# Environment variables
+# API Keys & Secrets
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "")
-GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
-VALIDATE_TWILIO_SIGNATURE = os.getenv("VALIDATE_TWILIO_SIGNATURE", "true").lower() == "true"
-
-# Google Calendar credentials as JSON string (for Railway/cloud deployment)
-# Paste your entire service_account.json content as a single-line string
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 
-# Singapore timezone
+# Model Configuration
+# Using Gemini 1.5 Flash as the stable workhorse, or 2.0-flash-exp if available to you
+MODEL_NAME = "gemini-3.0-flash" 
+
+# Timezone
 SGT = ZoneInfo("Asia/Singapore")
 
-# Business hours
-BUSINESS_HOUR_START = 10  # 10 AM
-BUSINESS_HOUR_END = 19    # 7 PM
-
 # Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# =============================================================================
-# PYDANTIC MODELS
-# =============================================================================
-
-class DogAnalysis(BaseModel):
-    """Result from Gemini vision analysis"""
-    breed: str
-    size: Literal["Small", "Medium", "Large"]
-    estimated_duration_minutes: int
-    coat_condition: str
-    friendly_comment: str = ""
-
-
-class UserState(str, Enum):
-    """Conversation states"""
-    IDLE = "IDLE"
-    AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
-
-
-class UserSession(BaseModel):
-    """User session data"""
-    state: UserState = UserState.IDLE
-    dog_analysis: Optional[DogAnalysis] = None
-    proposed_slot: Optional[datetime] = None
-    last_interaction: datetime = Field(default_factory=lambda: datetime.now(SGT))
-
-
-class BookingDetails(BaseModel):
-    """Appointment booking details"""
-    phone: str
-    breed: str
-    size: str
-    duration: int
-    coat_condition: str
-    start_time: datetime
-
-
-# =============================================================================
-# IN-MEMORY STATE STORAGE
-# =============================================================================
-
-user_sessions: dict[str, UserSession] = {}
-
-
-def get_session(phone: str) -> UserSession:
-    """Get or create user session"""
-    if phone not in user_sessions:
-        user_sessions[phone] = UserSession()
-    return user_sessions[phone]
-
-
-def update_session(phone: str, **kwargs) -> None:
-    """Update user session"""
-    session = get_session(phone)
-    for key, value in kwargs.items():
-        setattr(session, key, value)
-    session.last_interaction = datetime.now(SGT)
-
-
-def reset_session(phone: str) -> None:
-    """Reset user session"""
-    user_sessions[phone] = UserSession()
-
-
-# =============================================================================
-# TWILIO CLIENT
-# =============================================================================
-
-_twilio_client: Optional[TwilioClient] = None
-
-
-def get_twilio_client() -> TwilioClient:
-    """Get Twilio client singleton"""
-    global _twilio_client
-    if _twilio_client is None:
-        if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-            raise ValueError("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN required")
-        _twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    return _twilio_client
-
-
-def send_whatsapp_message(to: str, body: str) -> bool:
-    """
-    Send WhatsApp message via Twilio.
-
-    Args:
-        to: Recipient number (format: whatsapp:+1234567890)
-        body: Message text
-
-    Returns:
-        True if sent successfully
-    """
-    try:
-        client = get_twilio_client()
-        message = client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=to,
-            body=body
-        )
-        logger.info(f"Message sent: {message.sid}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to send message: {e}")
-        return False
-
-
-# =============================================================================
-# GOOGLE CALENDAR
-# =============================================================================
-
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
-_calendar_service = None
-
-
-def get_calendar_service():
-    """Get authenticated Google Calendar service"""
-    global _calendar_service
-
-    if _calendar_service is not None:
-        return _calendar_service
-
-    creds = None
-
-    # Priority 1: Environment variable (for Railway/cloud deployment)
-    if GOOGLE_CREDENTIALS_JSON:
-        logger.info("Using GOOGLE_CREDENTIALS_JSON environment variable")
-        try:
-            creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-            creds = service_account.Credentials.from_service_account_info(
-                creds_dict, scopes=SCOPES
-            )
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
-            raise ValueError("Invalid JSON in GOOGLE_CREDENTIALS_JSON environment variable")
-
-    # Priority 2: Service account file (local development)
-    elif os.path.exists("service_account.json"):
-        logger.info("Using service_account.json file")
-        creds = service_account.Credentials.from_service_account_file(
-            "service_account.json", scopes=SCOPES
-        )
-
-    # Priority 3: OAuth credentials file (local development)
-    elif os.path.exists("credentials.json"):
-        logger.info("Using OAuth credentials.json file")
-        if os.path.exists("token.json"):
-            creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(GoogleAuthRequest())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-                creds = flow.run_local_server(port=0)
-
-            with open("token.json", "w") as f:
-                f.write(creds.to_json())
-    else:
-        raise ValueError(
-            "No calendar credentials found. Set GOOGLE_CREDENTIALS_JSON env var "
-            "or add 'service_account.json' file"
-        )
-
-    _calendar_service = build("calendar", "v3", credentials=creds)
-    return _calendar_service
-
-
-def get_next_available_slot(duration_minutes: int) -> Optional[datetime]:
-    """
-    Find next available slot in Google Calendar.
-
-    Args:
-        duration_minutes: Required appointment duration
-
-    Returns:
-        datetime of next available slot or None
-    """
-    try:
-        service = get_calendar_service()
-    except FileNotFoundError as e:
-        logger.error(str(e))
-        return None
-
-    now = datetime.now(SGT)
-    time_max = now + timedelta(days=14)
-
-    # Fetch existing events
-    try:
-        events = service.events().list(
-            calendarId=GOOGLE_CALENDAR_ID,
-            timeMin=now.isoformat(),
-            timeMax=time_max.isoformat(),
-            singleEvents=True,
-            orderBy="startTime"
-        ).execute().get("items", [])
-    except Exception as e:
-        logger.error(f"Failed to fetch calendar: {e}")
-        return None
-
-    # Parse busy periods
-    busy = []
-    for event in events:
-        start = event["start"].get("dateTime")
-        end = event["end"].get("dateTime")
-        if start and end:
-            busy.append((
-                datetime.fromisoformat(start.replace("Z", "+00:00")),
-                datetime.fromisoformat(end.replace("Z", "+00:00"))
-            ))
-
-    busy.sort(key=lambda x: x[0])
-
-    # Search for available slot
-    duration = timedelta(minutes=duration_minutes + 15)  # 15 min buffer
-
-    for day_offset in range(14):
-        check_date = now.date() + timedelta(days=day_offset)
-
-        day_start = datetime(
-            check_date.year, check_date.month, check_date.day,
-            BUSINESS_HOUR_START, 0, tzinfo=SGT
-        )
-        day_end = datetime(
-            check_date.year, check_date.month, check_date.day,
-            BUSINESS_HOUR_END, 0, tzinfo=SGT
-        )
-
-        # Skip past times for today
-        if day_offset == 0 and now > day_start:
-            slot_start = now.replace(second=0, microsecond=0)
-            if slot_start.minute < 30:
-                slot_start = slot_start.replace(minute=30)
-            else:
-                slot_start = (slot_start + timedelta(hours=1)).replace(minute=0)
-        else:
-            slot_start = day_start
-
-        while slot_start + duration <= day_end:
-            slot_end = slot_start + duration
-            is_free = True
-
-            for busy_start, busy_end in busy:
-                busy_start_local = busy_start.astimezone(SGT)
-                busy_end_local = busy_end.astimezone(SGT)
-
-                if not (slot_end <= busy_start_local or slot_start >= busy_end_local):
-                    is_free = False
-                    slot_start = busy_end_local
-                    break
-
-            if is_free:
-                return slot_start
-
-            slot_start = slot_start + timedelta(minutes=30)
-
-    return None
-
-
-def book_slot(booking: BookingDetails) -> bool:
-    """
-    Create calendar event for booking.
-
-    Args:
-        booking: Appointment details
-
-    Returns:
-        True if booking created successfully
-    """
-    try:
-        service = get_calendar_service()
-    except FileNotFoundError:
-        return False
-
-    end_time = booking.start_time + timedelta(minutes=booking.duration)
-
-    event = {
-        "summary": f"Dog Grooming - {booking.breed}",
-        "description": (
-            f"Customer: {booking.phone}\n"
-            f"Breed: {booking.breed}\n"
-            f"Size: {booking.size}\n"
-            f"Coat: {booking.coat_condition}\n"
-            f"Duration: {booking.duration} min"
-        ),
-        "start": {
-            "dateTime": booking.start_time.isoformat(),
-            "timeZone": "Asia/Singapore"
-        },
-        "end": {
-            "dateTime": end_time.isoformat(),
-            "timeZone": "Asia/Singapore"
-        },
-        "reminders": {
-            "useDefault": False,
-            "overrides": [{"method": "popup", "minutes": 60}]
-        }
-    }
-
-    try:
-        service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-        logger.info(f"Booking created for {booking.phone}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to create booking: {e}")
-        return False
-
-
-# =============================================================================
-# GEMINI AI - THE BRAIN OF THE BOT
-# =============================================================================
-
-# System prompt that defines the AI receptionist personality
-RECEPTIONIST_SYSTEM_PROMPT = """You are Bella, a warm and friendly receptionist at "Pawsome Grooming" - a premium pet grooming salon in Singapore. You genuinely love dogs and it shows in how you talk about them.
-
-YOUR PERSONALITY:
-- Warm, friendly, and enthusiastic about dogs
-- Professional but not stiff - you chat like a real person
-- You notice specific details about each dog and comment on them
-- You use emojis naturally but not excessively
-- You're helpful and patient, even with confused customers
-
-YOUR JOB:
-1. When customers send dog photos: Analyze the dog, identify breed/size, assess coat condition, and offer a grooming appointment
-2. When customers chat: Answer questions about services, pricing, or just have a friendly conversation
-3. Guide customers through the booking process naturally
-
-PRICING (Singapore Dollars):
-- Small dogs (under 10kg): $50-60
-- Medium dogs (10-25kg): $70-80
-- Large dogs (over 25kg): $90-110
-- Add $15-25 for matted/tangled coats
-- Add $10 for special treatments (de-shedding, teeth cleaning, nail art)
-
-GROOMING DURATION:
-- Small: ~60 minutes
-- Medium: ~90 minutes
-- Large: ~120 minutes
-- Add 30 mins for matted coats
-
-BUSINESS HOURS: 10 AM - 7 PM daily (Singapore Time)
-
-IMPORTANT RULES:
-- Always be genuine and specific - never give generic responses
-- When you see a dog photo, describe what YOU actually see (color, expression, features)
-- If you can't clearly see the dog, ask for another photo nicely
-- Keep responses concise - this is WhatsApp, not email
-- Use *bold* for important info like dates and times
-- When confirming bookings, be excited for the customer!"""
-
-
-def configure_gemini():
-    """Configure Gemini API"""
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY environment variable not set")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("BellaBot")
+
+# Configure Gemini
+if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
+# =============================================================================
+# GOOGLE CALENDAR MANAGER
+# =============================================================================
 
-def get_gemini_model():
-    """Get configured Gemini model with system prompt"""
-    configure_gemini()
-    return genai.GenerativeModel(
-        model_name="gemini-2.5-flash-preview-05-20",
-        system_instruction=RECEPTIONIST_SYSTEM_PROMPT
-    )
+class CalendarManager:
+    """Handles Google Calendar interactions."""
+    
+    SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+    def __init__(self):
+        self.service = self._authenticate()
 
-async def download_image(image_url: str) -> tuple[bytes, str]:
-    """Download image from Twilio URL"""
-    import httpx
+    def _authenticate(self):
+        creds = None
+        # 1. Try Environment Variable (Production)
+        if GOOGLE_CREDENTIALS_JSON:
+            try:
+                info = json.loads(GOOGLE_CREDENTIALS_JSON)
+                creds = service_account.Credentials.from_service_account_info(info, scopes=self.SCOPES)
+            except Exception as e:
+                logger.error(f"Creds Error: {e}")
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(
-            image_url,
-            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        )
-        response.raise_for_status()
+        # 2. Try Local File (Dev)
+        elif os.path.exists("service_account.json"):
+            creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=self.SCOPES)
+        
+        # 3. Try OAuth Token (Dev)
+        elif os.path.exists("token.json"):
+            creds = Credentials.from_authorized_user_file("token.json", self.SCOPES)
 
-        content_type = response.headers.get("content-type", "image/jpeg")
-        if ";" in content_type:
-            content_type = content_type.split(";")[0].strip()
+        if not creds:
+            logger.warning("No Calendar Credentials found. Calendar tools will fail.")
+            return None
 
-        return response.content, content_type
+        return build("calendar", "v3", credentials=creds)
 
+    def find_next_slot(self, duration_minutes: int = 90) -> str:
+        """Finds the next available slot starting from tomorrow."""
+        if not self.service: return "Calendar unavailable."
+        
+        now = datetime.now(SGT)
+        start_search = (now + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+        end_search = start_search + timedelta(days=7) # Look ahead 7 days
 
-async def analyze_dog_with_gemini(image_url: str, user_message: str = "") -> tuple[Optional[DogAnalysis], str]:
-    """
-    Analyze dog image and generate a natural response using Gemini.
+        # Get busy events
+        events_result = self.service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=start_search.isoformat(),
+            timeMax=end_search.isoformat(),
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        events = events_result.get('items', [])
 
-    Returns:
-        Tuple of (DogAnalysis or None, response_message)
-    """
-    import base64
+        busy_times = []
+        for event in events:
+            start = event['start'].get('dateTime') or event['start'].get('date')
+            end = event['end'].get('dateTime') or event['end'].get('date')
+            busy_times.append((start, end))
 
-    try:
-        # Download the image
-        image_bytes, content_type = await download_image(image_url)
-        logger.info(f"Downloaded image: {len(image_bytes)} bytes, type: {content_type}")
+        # Simple linear search for a free slot (10am - 7pm)
+        current_check = start_search
+        while current_check < end_search:
+            if current_check.hour >= 19: # Closed after 7pm
+                current_check = (current_check + timedelta(days=1)).replace(hour=10, minute=0)
+                continue
+            
+            slot_end = current_check + timedelta(minutes=duration_minutes)
+            
+            # Check collision
+            collision = False
+            for b_start, b_end in busy_times:
+                # Basic string comparison for ISO format works for simple overlap check
+                if not (slot_end.isoformat() <= b_start or current_check.isoformat() >= b_end):
+                    collision = True
+                    break
+            
+            if not collision:
+                return current_check.strftime("%A, %d %B at %I:%M %p")
+            
+            current_check += timedelta(minutes=30)
+            
+        return "No slots available in the next 7 days."
 
-        model = get_gemini_model()
+    def book_appointment(self, summary: str, time_str: str, duration_minutes: int) -> str:
+        """Books a specific slot. Expects time_str in a parseable format or ISO."""
+        if not self.service: return "System Error: Calendar not connected."
 
-        # Create image part
-        image_part = {
-            "inline_data": {
-                "mime_type": content_type,
-                "data": base64.b64encode(image_bytes).decode("utf-8")
-            }
+        try:
+            # AI usually passes "Monday, 20 October at 10:00 AM" or ISO. 
+            # For robustness, we will ask the AI to pass ISO in the system prompt, 
+            # but here we parse a simplified version for demo.
+            # IN PRODUCTION: Use dateparser or strict ISO passing from LLM.
+            
+            # For this demo, we trust the AI found the slot via find_next_slot, 
+            # so we reconstruct the datetime object roughly or expect ISO.
+            # Let's assume the AI passes ISO string for reliability.
+            start_dt = datetime.fromisoformat(time_str) 
+        except ValueError:
+            # Fallback: Try to parse the human string relative to now (simple heuristics)
+            return "Error: Invalid time format. Please contact human support."
+
+        end_dt = start_dt + timedelta(minutes=duration_minutes)
+
+        event = {
+            'summary': summary,
+            'start': {'dateTime': start_dt.isoformat(), 'timeZone': 'Asia/Singapore'},
+            'end': {'dateTime': end_dt.isoformat(), 'timeZone': 'Asia/Singapore'},
         }
 
-        # Prompt for structured analysis + natural response
-        analysis_prompt = f"""A customer just sent this photo of their dog{f' with message: "{user_message}"' if user_message else ''}.
+        try:
+            self.service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
+            return "Success! Appointment booked."
+        except Exception as e:
+            logger.error(f"Booking failed: {e}")
+            return "Failed to book slot."
 
-First, analyze the dog and extract this information (for our booking system):
-- breed: Your best guess at the breed or mix
-- size: exactly "Small", "Medium", or "Large"
-- estimated_duration_minutes: integer (60/90/120 + 30 if matted)
-- coat_condition: describe what you see
-- price: estimated price in SGD
+calendar = CalendarManager()
 
-Then, write a friendly response to the customer. In your response:
-1. Comment on something SPECIFIC you notice about their dog (color, expression, cute features)
-2. Share the grooming details naturally
-3. Offer them an available appointment slot
+# =============================================================================
+# AI TOOLS (FUNCTION CALLING)
+# =============================================================================
 
-RESPOND IN THIS EXACT FORMAT:
-===ANALYSIS===
-breed: <breed>
-size: <Small/Medium/Large>
-duration: <minutes>
-coat: <condition>
-price: <amount>
-===RESPONSE===
-<your friendly message to the customer>"""
+# Global store for conversation context (In production, use Redis/DB)
+session_store: Dict[str, Dict[str, Any]] = {}
 
-        result = model.generate_content([analysis_prompt, image_part])
-        response_text = result.text.strip()
+def get_session(phone: str) -> Dict:
+    if phone not in session_store:
+        session_store[phone] = {"history": [], "dog_data": {}}
+    return session_store[phone]
 
-        logger.info(f"Gemini full response:\n{response_text}")
+# --- Tools exposed to Gemini ---
 
-        # Parse the structured response
-        analysis = None
-        message = response_text
-
-        if "===ANALYSIS===" in response_text and "===RESPONSE===" in response_text:
-            parts = response_text.split("===RESPONSE===")
-            analysis_part = parts[0].replace("===ANALYSIS===", "").strip()
-            message = parts[1].strip() if len(parts) > 1 else response_text
-
-            # Parse analysis fields
-            try:
-                lines = analysis_part.split("\n")
-                data = {}
-                for line in lines:
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        data[key.strip().lower()] = value.strip()
-
-                # Map size string
-                size = data.get("size", "Medium")
-                if size not in ["Small", "Medium", "Large"]:
-                    size = "Medium"
-
-                # Parse duration
-                duration = 90
-                try:
-                    duration = int(''.join(filter(str.isdigit, data.get("duration", "90"))))
-                except:
-                    pass
-
-                analysis = DogAnalysis(
-                    breed=data.get("breed", "Mixed breed"),
-                    size=size,
-                    estimated_duration_minutes=duration,
-                    coat_condition=data.get("coat", "normal"),
-                    friendly_comment=""
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to parse analysis: {e}")
-
-        return analysis, message
-
-    except Exception as e:
-        logger.error(f"Gemini analysis failed: {e}")
-        return None, (
-            "Hmm, I'm having a bit of trouble seeing that photo clearly! 📸\n\n"
-            "Could you send another one? A nice bright shot where I can see your pup's full face and body works best!"
-        )
-
-
-async def chat_with_gemini(user_message: str, context: dict) -> str:
+def check_availability(duration_minutes: int = 90):
     """
-    Generate a conversational response using Gemini.
-
+    Checks the calendar for the next available grooming slot.
     Args:
-        user_message: The user's text message
-        context: Session context (state, dog_analysis, proposed_slot, etc.)
+        duration_minutes: Duration of the service (Small=60, Med=90, Large=120).
     """
-    try:
-        model = get_gemini_model()
+    logger.info(f"Tool Call: Checking availability for {duration_minutes} mins")
+    return calendar.find_next_slot(duration_minutes)
 
-        # Build context for Gemini
-        context_info = []
+def save_dog_details(breed: str, size: str, coat_condition: str, estimated_price: int):
+    """
+    Saves the analyzed dog details to the system. 
+    MUST be called whenever a dog photo is received.
+    """
+    logger.info(f"Tool Call: Saving dog - {breed}, {size}, ${estimated_price}")
+    # In a real app, save to DB here.
+    return "Dog details saved successfully. You may now offer appointments."
 
-        if context.get("state") == "AWAITING_CONFIRMATION":
-            analysis = context.get("dog_analysis")
-            slot = context.get("proposed_slot")
-            if analysis and slot:
-                context_info.append(f"CURRENT CONTEXT: Customer is deciding on a booking.")
-                context_info.append(f"Dog: {analysis.breed} ({analysis.size})")
-                context_info.append(f"Duration: {analysis.estimated_duration_minutes} mins")
-                context_info.append(f"Proposed slot: {slot.strftime('%A, %d %B at %I:%M %p')}")
-                context_info.append("If they confirm (yes/ok/sure/etc), celebrate and confirm the booking!")
-                context_info.append("If they decline (no/cancel/etc), be understanding and invite them back.")
+def confirm_booking(customer_phone: str, date_iso: str, service_name: str):
+    """
+    Finalizes the booking in the calendar.
+    Args:
+        customer_phone: The user's phone number.
+        date_iso: The exact date/time in ISO format (e.g., 2025-10-24T14:00:00).
+        service_name: Summary of service (e.g., 'Grooming for Poodle').
+    """
+    logger.info(f"Tool Call: Booking for {customer_phone} at {date_iso}")
+    # Basic logic to estimate duration based on service name or default to 90
+    return calendar.book_appointment(f"{service_name} ({customer_phone})", date_iso, 90)
 
-        context_str = "\n".join(context_info) if context_info else "Customer is starting a new conversation."
+# Tool Map for Gemini
+tools_map = {
+    'check_availability': check_availability,
+    'save_dog_details': save_dog_details,
+    'confirm_booking': confirm_booking
+}
 
-        prompt = f"""{context_str}
-
-Customer message: "{user_message}"
-
-Respond naturally as Bella the receptionist. Keep it concise for WhatsApp.
-If they're asking about services/pricing, be helpful.
-If they want to book, ask them to send a dog photo.
-If they're confirming/declining a booking, respond appropriately."""
-
-        result = model.generate_content(prompt)
-        return result.text.strip()
-
-    except Exception as e:
-        logger.error(f"Gemini chat failed: {e}")
-        return (
-            "I'd love to help you book a grooming session! 🐕\n\n"
-            "Just send me a photo of your dog and I'll check what slots are available."
-        )
-
+tools_list = [check_availability, save_dog_details, confirm_booking]
 
 # =============================================================================
-# MESSAGE HANDLERS
+# SYSTEM PROMPT
 # =============================================================================
 
-async def handle_image(phone: str, media_url: str, caption: str = "") -> str:
-    """Handle incoming image message using Gemini AI"""
+SYSTEM_INSTRUCTION = """
+You are Bella, the AI Receptionist at Pawsome Grooming Singapore.
+Your goal is to be helpful, warm, and efficient.
 
-    # Get analysis and AI-generated response
-    analysis, ai_response = await analyze_dog_with_gemini(media_url, caption)
+CORE BEHAVIORS:
+1. **Visual Analysis**: When you receive a dog photo, you MUST analyze it and immediately call the `save_dog_details` tool with your best estimates (Breed, Size [Small/Medium/Large], Coat Condition, Price).
+   - Prices: Small ($50), Medium ($70), Large ($90). Add $15 for matted coats.
+   - Do NOT ask the user for these details if you can see them. Just state: "I've noted he's a [Breed]..."
 
-    if not analysis:
-        # Gemini couldn't analyze - return the error message it generated
-        return ai_response
+2. **Scheduling**:
+   - Never make up times. Always use `check_availability` to find a real slot.
+   - When offering a slot, speak naturally: "I have an opening this Thursday at 2 PM."
 
-    # Find next available slot
-    slot = get_next_available_slot(analysis.estimated_duration_minutes)
+3. **Booking**:
+   - Once the user agrees to a time, call `confirm_booking`.
+   - Ask for their name if you don't have it before booking.
 
-    if not slot:
-        # No slots available - let Gemini know and regenerate response
-        return (
-            f"{ai_response}\n\n"
-            "Unfortunately, we're fully booked for the next two weeks! 😔 "
-            "Feel free to check back soon or give us a call to join the waitlist."
-        )
+4. **Personality**:
+   - Use Singaporean flair occasionally (can use 'lah', 'leh' sparsely).
+   - Be enthusiastic about dogs! "Omg so cute!" is acceptable.
 
-    # Update session with booking info
-    update_session(
-        phone,
-        state=UserState.AWAITING_CONFIRMATION,
-        dog_analysis=analysis,
-        proposed_slot=slot
-    )
-
-    # Append slot info to Gemini's response if not already mentioned
-    date_str = slot.strftime("%A, %d %B")
-    time_str = slot.strftime("%I:%M %p")
-
-    # Check if response already mentions a specific time
-    if "slot" not in ai_response.lower() and "available" not in ai_response.lower():
-        ai_response += f"\n\nI have an opening on *{date_str}* at *{time_str}* - would that work for you? Just reply *Yes* to book or *No* to pass!"
-    else:
-        # Replace placeholder slot mention with actual slot
-        ai_response += f"\n\nReply *Yes* to confirm *{date_str}* at *{time_str}*, or *No* if that doesn't work!"
-
-    return ai_response
-
-
-async def handle_text(phone: str, text: str) -> str:
-    """Handle incoming text message using Gemini AI"""
-    session = get_session(phone)
-    text_lower = text.strip().lower()
-
-    # Check if user is confirming/declining a booking
-    if session.state == UserState.AWAITING_CONFIRMATION:
-        # Positive confirmations
-        if any(word in text_lower for word in ["yes", "yep", "yeah", "ok", "okay", "sure", "confirm", "book", "sounds good", "let's do it", "perfect"]):
-            if session.dog_analysis and session.proposed_slot:
-                booking = BookingDetails(
-                    phone=phone,
-                    breed=session.dog_analysis.breed,
-                    size=session.dog_analysis.size,
-                    duration=session.dog_analysis.estimated_duration_minutes,
-                    coat_condition=session.dog_analysis.coat_condition,
-                    start_time=session.proposed_slot
-                )
-
-                if book_slot(booking):
-                    date_str = session.proposed_slot.strftime("%A, %d %B")
-                    time_str = session.proposed_slot.strftime("%I:%M %p")
-                    breed = booking.breed
-                    reset_session(phone)
-
-                    # Let Gemini generate the confirmation message
-                    context = {
-                        "action": "booking_confirmed",
-                        "date": date_str,
-                        "time": time_str,
-                        "breed": breed
-                    }
-                    return await chat_with_gemini(
-                        f"Customer confirmed booking for their {breed} on {date_str} at {time_str}. Celebrate with them!",
-                        context
-                    )
-                else:
-                    reset_session(phone)
-                    return await chat_with_gemini(
-                        "The booking system had an error. Apologize and ask them to try again.",
-                        {}
-                    )
-
-            reset_session(phone)
-            return await chat_with_gemini(
-                "Customer's session expired. Ask them to send a new dog photo.",
-                {}
-            )
-
-        # Negative responses
-        elif any(word in text_lower for word in ["no", "nope", "nah", "cancel", "not now", "maybe later", "don't", "cant", "can't"]):
-            reset_session(phone)
-            return await chat_with_gemini(
-                "Customer declined the booking. Be understanding and invite them to book another time.",
-                {}
-            )
-
-    # Build context for Gemini
-    context = {
-        "state": session.state.value if session.state else "IDLE",
-        "dog_analysis": session.dog_analysis,
-        "proposed_slot": session.proposed_slot
-    }
-
-    # Let Gemini handle all other conversations
-    return await chat_with_gemini(text, context)
-
+5. **Audio**:
+   - You can hear audio messages. Respond to them textually as if they were written text.
+"""
 
 # =============================================================================
-# FASTAPI APPLICATION
+# FASTAPI APP
 # =============================================================================
 
-app = FastAPI(
-    title="Pet Grooming WhatsApp Bot",
-    description="Twilio + Gemini + Google Calendar",
-    version="2.0.0"
-)
+app = FastAPI()
 
-
-@app.on_event("startup")
-async def startup():
-    """Validate configuration on startup"""
-    logger.info("Starting Pet Grooming Bot...")
-
-    warnings = []
-    if not GEMINI_API_KEY:
-        warnings.append("GEMINI_API_KEY not set")
-    if not TWILIO_ACCOUNT_SID:
-        warnings.append("TWILIO_ACCOUNT_SID not set")
-    if not TWILIO_AUTH_TOKEN:
-        warnings.append("TWILIO_AUTH_TOKEN not set")
-    if not TWILIO_WHATSAPP_NUMBER:
-        warnings.append("TWILIO_WHATSAPP_NUMBER not set")
-    if not GOOGLE_CREDENTIALS_JSON and not os.path.exists("service_account.json") and not os.path.exists("credentials.json"):
-        warnings.append("No Google Calendar credentials (set GOOGLE_CREDENTIALS_JSON or add credentials file)")
-
-    for w in warnings:
-        logger.warning(f"Warning: {w}")
-
-    if not warnings:
-        logger.info("All configurations OK")
-
-
-@app.get("/")
-async def root():
-    """Health check"""
-    return {"status": "healthy", "service": "Pet Grooming Bot"}
-
-
-@app.get("/health")
-async def health():
-    """Detailed health check"""
-    return {
-        "status": "healthy",
-        "gemini": bool(GEMINI_API_KEY),
-        "twilio": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN),
-        "calendar": bool(GOOGLE_CREDENTIALS_JSON) or os.path.exists("service_account.json") or os.path.exists("credentials.json"),
-        "active_sessions": len(user_sessions)
-    }
-
+async def download_media(media_url: str) -> tuple[bytes, str]:
+    """Downloads media from Twilio URL."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+        return resp.content, resp.headers.get("Content-Type", "")
 
 @app.post("/webhook")
-async def webhook(
-    request: Request,
+async def whatsapp_webhook(
     From: str = Form(...),
-    Body: str = Form(default=""),
-    NumMedia: str = Form(default="0"),
-    MediaUrl0: Optional[str] = Form(default=None),
-    MediaContentType0: Optional[str] = Form(default=None),
+    Body: str = Form(""),
+    NumMedia: int = Form(0),
+    MediaUrl0: str = Form(None),
+    MediaContentType0: str = Form(None)
 ):
-    """
-    Twilio WhatsApp webhook endpoint.
+    """Unified Webhook for Text, Image, and Audio"""
+    
+    session = get_session(From)
+    history = session["history"]
+    
+    # 1. Prepare User Input (Multimodal)
+    user_parts = []
+    
+    # Add Text (if any)
+    if Body:
+        user_parts.append(Body)
+        
+    # Add Media (Image or Audio)
+    if NumMedia > 0 and MediaUrl0:
+        media_data, mime_type = await download_media(MediaUrl0)
+        
+        # Determine strict MIME type for Gemini
+        if "image" in mime_type:
+            user_parts.append({
+                "mime_type": mime_type,
+                "data": media_data # Gemini SDK handles bytes directly in this dict format usually
+            })
+            # Note: For strict SDK usage, we often use:
+            # {"inline_data": {"mime_type": ..., "data": base64_str}}
+            # But the newer SDK allows simpler passing. Let's stick to the safest way:
+            b64_data = base64.b64encode(media_data).decode('utf-8')
+            user_parts[-1] = {"inline_data": {"mime_type": mime_type, "data": b64_data}}
+            
+        elif "audio" in mime_type or "ogg" in mime_type:
+            # Voice Note
+            b64_data = base64.b64encode(media_data).decode('utf-8')
+            # Map whatsapp audio/ogg to a type Gemini supports if needed, usually audio/ogg is fine
+            user_parts.append({"inline_data": {"mime_type": "audio/ogg", "data": b64_data}})
 
-    Twilio sends form-encoded POST with fields:
-    - From: Sender number (whatsapp:+1234567890)
-    - Body: Message text
-    - NumMedia: Number of media attachments
-    - MediaUrl0: URL of first media attachment
-    - MediaContentType0: MIME type of first media
-    """
-    # Validate Twilio signature (optional but recommended)
-    if VALIDATE_TWILIO_SIGNATURE and TWILIO_AUTH_TOKEN:
-        validator = RequestValidator(TWILIO_AUTH_TOKEN)
-        url = str(request.url)
-        form_data = dict(await request.form())
-        signature = request.headers.get("X-Twilio-Signature", "")
+    if not user_parts:
+        return Response(content=str(MessagingResponse()), media_type="application/xml")
 
-        if not validator.validate(url, form_data, signature):
-            logger.warning("Invalid Twilio signature")
-            raise HTTPException(status_code=403, detail="Invalid signature")
+    # 2. Initialize Gemini Chat with History
+    # We rebuild the chat object each time to persist state in our own DB/Memory
+    # (Gemini's history object is not serializable easily, so we pass history list)
+    
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        system_instruction=SYSTEM_INSTRUCTION,
+        tools=tools_list
+    )
+    
+    chat = model.start_chat(history=history, enable_automatic_function_calling=True)
 
-    logger.info(f"Message from {From}: {Body[:50]}... Media: {NumMedia}")
-
-    # Process message
-    phone = From  # Format: whatsapp:+1234567890
-
+    # 3. Send Message to AI
     try:
-        num_media = int(NumMedia)
-    except ValueError:
-        num_media = 0
+        response = chat.send_message(user_parts)
+        ai_text = response.text
+        
+        # 4. Update History (Manually, since we recreate chat next time)
+        # Note: Handling history with images manually is complex. 
+        # For simplicity in this script, we just append text. 
+        # In production, use File API for images in history.
+        session["history"].append({"role": "user", "parts": [Body or "[Media Message]"]})
+        session["history"].append({"role": "model", "parts": [ai_text]})
+        
+        # Trim history to prevent context overflow
+        if len(session["history"]) > 10:
+            session["history"] = session["history"][-10:]
 
-    # Handle image if present (Body may contain caption)
-    if num_media > 0 and MediaUrl0:
-        response_text = await handle_image(phone, MediaUrl0, caption=Body)
-    else:
-        response_text = await handle_text(phone, Body)
+    except Exception as e:
+        logger.error(f"AI Error: {e}")
+        ai_text = "Oh dear, my brain froze for a second! 🐕 Could you try saying that again?"
 
-    # Return TwiML response
+    # 5. Send Response via Twilio
     twiml = MessagingResponse()
-    twiml.message(response_text)
-
+    twiml.message(ai_text)
+    
     return Response(content=str(twiml), media_type="application/xml")
-
-
-@app.get("/sessions")
-async def list_sessions():
-    """Debug: List active sessions"""
-    return {
-        phone: {
-            "state": s.state.value,
-            "has_analysis": s.dog_analysis is not None,
-            "has_slot": s.proposed_slot is not None
-        }
-        for phone, s in user_sessions.items()
-    }
-
-
-# =============================================================================
-# MAIN
-# =============================================================================
 
 if __name__ == "__main__":
     import uvicorn
-
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
