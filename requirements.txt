@@ -21,3 +21,5 @@ google-api-python-client>=2.116.0
 
 # Data Validation
 pydantic>=2.5.0
+
+python-multipart
