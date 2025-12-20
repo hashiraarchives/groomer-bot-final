@@ -403,8 +403,47 @@ def book_slot(booking: BookingDetails) -> bool:
 
 
 # =============================================================================
-# GEMINI VISION
+# GEMINI AI - THE BRAIN OF THE BOT
 # =============================================================================
+
+# System prompt that defines the AI receptionist personality
+RECEPTIONIST_SYSTEM_PROMPT = """You are Bella, a warm and friendly receptionist at "Pawsome Grooming" - a premium pet grooming salon in Singapore. You genuinely love dogs and it shows in how you talk about them.
+
+YOUR PERSONALITY:
+- Warm, friendly, and enthusiastic about dogs
+- Professional but not stiff - you chat like a real person
+- You notice specific details about each dog and comment on them
+- You use emojis naturally but not excessively
+- You're helpful and patient, even with confused customers
+
+YOUR JOB:
+1. When customers send dog photos: Analyze the dog, identify breed/size, assess coat condition, and offer a grooming appointment
+2. When customers chat: Answer questions about services, pricing, or just have a friendly conversation
+3. Guide customers through the booking process naturally
+
+PRICING (Singapore Dollars):
+- Small dogs (under 10kg): $50-60
+- Medium dogs (10-25kg): $70-80
+- Large dogs (over 25kg): $90-110
+- Add $15-25 for matted/tangled coats
+- Add $10 for special treatments (de-shedding, teeth cleaning, nail art)
+
+GROOMING DURATION:
+- Small: ~60 minutes
+- Medium: ~90 minutes
+- Large: ~120 minutes
+- Add 30 mins for matted coats
+
+BUSINESS HOURS: 10 AM - 7 PM daily (Singapore Time)
+
+IMPORTANT RULES:
+- Always be genuine and specific - never give generic responses
+- When you see a dog photo, describe what YOU actually see (color, expression, features)
+- If you can't clearly see the dog, ask for another photo nicely
+- Keep responses concise - this is WhatsApp, not email
+- Use *bold* for important info like dates and times
+- When confirming bookings, be excited for the customer!"""
+
 
 def configure_gemini():
     """Configure Gemini API"""
@@ -413,63 +452,50 @@ def configure_gemini():
     genai.configure(api_key=GEMINI_API_KEY)
 
 
-async def analyze_dog_image(image_url: str) -> Optional[DogAnalysis]:
-    """
-    Analyze dog image using Gemini Vision.
-
-    Args:
-        image_url: URL of the dog image (from Twilio MediaUrl0)
-
-    Returns:
-        DogAnalysis result or None if failed
-    """
-    import httpx
-    import base64
-
+def get_gemini_model():
+    """Get configured Gemini model with system prompt"""
     configure_gemini()
+    return genai.GenerativeModel(
+        model_name="gemini-2.5-flash-preview-05-20",
+        system_instruction=RECEPTIONIST_SYSTEM_PROMPT
+    )
 
-    # Use Gemini 2.5 Flash (latest model with vision)
-    model = genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
 
-    prompt = """You're a friendly pet grooming expert. Analyze this dog photo and return ONLY a JSON object (no markdown, no extra text):
+async def download_image(image_url: str) -> tuple[bytes, str]:
+    """Download image from Twilio URL"""
+    import httpx
 
-{
-    "breed": "<your best guess at the breed or mix>",
-    "size": "<exactly one of: Small, Medium, Large>",
-    "estimated_duration_minutes": <integer>,
-    "coat_condition": "<describe the coat: normal, matted, tangled, fluffy, well-maintained, needs brushing, etc.>",
-    "friendly_comment": "<a warm, personalized 1-sentence comment about this specific dog>"
-}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            image_url,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        )
+        response.raise_for_status()
 
-Size guidelines:
-- Small: under 10kg (Chihuahua, Pomeranian, Shih Tzu, etc.)
-- Medium: 10-25kg (Beagle, Cocker Spaniel, Border Collie, etc.)
-- Large: over 25kg (Golden Retriever, German Shepherd, Labrador, etc.)
-
-Grooming duration:
-- Small: 60 min | Medium: 90 min | Large: 120 min
-- Add 30 min if coat looks matted or tangled
-
-Return ONLY valid JSON, nothing else."""
-
-    try:
-        # Fetch image from Twilio (requires authentication)
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                image_url,
-                auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-            )
-            response.raise_for_status()
-            image_bytes = response.content
-
-        # Detect mime type from response or default to jpeg
         content_type = response.headers.get("content-type", "image/jpeg")
         if ";" in content_type:
             content_type = content_type.split(";")[0].strip()
 
+        return response.content, content_type
+
+
+async def analyze_dog_with_gemini(image_url: str, user_message: str = "") -> tuple[Optional[DogAnalysis], str]:
+    """
+    Analyze dog image and generate a natural response using Gemini.
+
+    Returns:
+        Tuple of (DogAnalysis or None, response_message)
+    """
+    import base64
+
+    try:
+        # Download the image
+        image_bytes, content_type = await download_image(image_url)
         logger.info(f"Downloaded image: {len(image_bytes)} bytes, type: {content_type}")
 
-        # Create image part in correct format for google-generativeai SDK
+        model = get_gemini_model()
+
+        # Create image part
         image_part = {
             "inline_data": {
                 "mime_type": content_type,
@@ -477,62 +503,160 @@ Return ONLY valid JSON, nothing else."""
             }
         }
 
-        # Generate analysis
-        result = model.generate_content([prompt, image_part])
-        text = result.text.strip()
+        # Prompt for structured analysis + natural response
+        analysis_prompt = f"""A customer just sent this photo of their dog{f' with message: "{user_message}"' if user_message else ''}.
 
-        logger.info(f"Gemini response: {text[:200]}")
+First, analyze the dog and extract this information (for our booking system):
+- breed: Your best guess at the breed or mix
+- size: exactly "Small", "Medium", or "Large"
+- estimated_duration_minutes: integer (60/90/120 + 30 if matted)
+- coat_condition: describe what you see
+- price: estimated price in SGD
 
-        # Clean markdown if present
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1])
+Then, write a friendly response to the customer. In your response:
+1. Comment on something SPECIFIC you notice about their dog (color, expression, cute features)
+2. Share the grooming details naturally
+3. Offer them an available appointment slot
 
-        data = json.loads(text)
+RESPOND IN THIS EXACT FORMAT:
+===ANALYSIS===
+breed: <breed>
+size: <Small/Medium/Large>
+duration: <minutes>
+coat: <condition>
+price: <amount>
+===RESPONSE===
+<your friendly message to the customer>"""
 
-        return DogAnalysis(
-            breed=data["breed"],
-            size=data["size"],
-            estimated_duration_minutes=data["estimated_duration_minutes"],
-            coat_condition=data["coat_condition"],
-            friendly_comment=data.get("friendly_comment", "")
-        )
+        result = model.generate_content([analysis_prompt, image_part])
+        response_text = result.text.strip()
 
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse Gemini response: {e}")
-        return None
+        logger.info(f"Gemini full response:\n{response_text}")
+
+        # Parse the structured response
+        analysis = None
+        message = response_text
+
+        if "===ANALYSIS===" in response_text and "===RESPONSE===" in response_text:
+            parts = response_text.split("===RESPONSE===")
+            analysis_part = parts[0].replace("===ANALYSIS===", "").strip()
+            message = parts[1].strip() if len(parts) > 1 else response_text
+
+            # Parse analysis fields
+            try:
+                lines = analysis_part.split("\n")
+                data = {}
+                for line in lines:
+                    if ":" in line:
+                        key, value = line.split(":", 1)
+                        data[key.strip().lower()] = value.strip()
+
+                # Map size string
+                size = data.get("size", "Medium")
+                if size not in ["Small", "Medium", "Large"]:
+                    size = "Medium"
+
+                # Parse duration
+                duration = 90
+                try:
+                    duration = int(''.join(filter(str.isdigit, data.get("duration", "90"))))
+                except:
+                    pass
+
+                analysis = DogAnalysis(
+                    breed=data.get("breed", "Mixed breed"),
+                    size=size,
+                    estimated_duration_minutes=duration,
+                    coat_condition=data.get("coat", "normal"),
+                    friendly_comment=""
+                )
+
+            except Exception as e:
+                logger.error(f"Failed to parse analysis: {e}")
+
+        return analysis, message
+
     except Exception as e:
         logger.error(f"Gemini analysis failed: {e}")
-        return None
+        return None, (
+            "Hmm, I'm having a bit of trouble seeing that photo clearly! 📸\n\n"
+            "Could you send another one? A nice bright shot where I can see your pup's full face and body works best!"
+        )
+
+
+async def chat_with_gemini(user_message: str, context: dict) -> str:
+    """
+    Generate a conversational response using Gemini.
+
+    Args:
+        user_message: The user's text message
+        context: Session context (state, dog_analysis, proposed_slot, etc.)
+    """
+    try:
+        model = get_gemini_model()
+
+        # Build context for Gemini
+        context_info = []
+
+        if context.get("state") == "AWAITING_CONFIRMATION":
+            analysis = context.get("dog_analysis")
+            slot = context.get("proposed_slot")
+            if analysis and slot:
+                context_info.append(f"CURRENT CONTEXT: Customer is deciding on a booking.")
+                context_info.append(f"Dog: {analysis.breed} ({analysis.size})")
+                context_info.append(f"Duration: {analysis.estimated_duration_minutes} mins")
+                context_info.append(f"Proposed slot: {slot.strftime('%A, %d %B at %I:%M %p')}")
+                context_info.append("If they confirm (yes/ok/sure/etc), celebrate and confirm the booking!")
+                context_info.append("If they decline (no/cancel/etc), be understanding and invite them back.")
+
+        context_str = "\n".join(context_info) if context_info else "Customer is starting a new conversation."
+
+        prompt = f"""{context_str}
+
+Customer message: "{user_message}"
+
+Respond naturally as Bella the receptionist. Keep it concise for WhatsApp.
+If they're asking about services/pricing, be helpful.
+If they want to book, ask them to send a dog photo.
+If they're confirming/declining a booking, respond appropriately."""
+
+        result = model.generate_content(prompt)
+        return result.text.strip()
+
+    except Exception as e:
+        logger.error(f"Gemini chat failed: {e}")
+        return (
+            "I'd love to help you book a grooming session! 🐕\n\n"
+            "Just send me a photo of your dog and I'll check what slots are available."
+        )
 
 
 # =============================================================================
 # MESSAGE HANDLERS
 # =============================================================================
 
-async def handle_image(phone: str, media_url: str) -> str:
-    """Handle incoming image message"""
-    analysis = await analyze_dog_image(media_url)
+async def handle_image(phone: str, media_url: str, caption: str = "") -> str:
+    """Handle incoming image message using Gemini AI"""
+
+    # Get analysis and AI-generated response
+    analysis, ai_response = await analyze_dog_with_gemini(media_url, caption)
 
     if not analysis:
-        return (
-            "Hmm, I'm having trouble seeing your pup clearly in that photo! 🐕\n\n"
-            "Could you send me another one? A well-lit shot where I can see "
-            "the whole dog works best!"
-        )
+        # Gemini couldn't analyze - return the error message it generated
+        return ai_response
 
+    # Find next available slot
     slot = get_next_available_slot(analysis.estimated_duration_minutes)
 
     if not slot:
-        comment = f" {analysis.friendly_comment}" if analysis.friendly_comment else ""
+        # No slots available - let Gemini know and regenerate response
         return (
-            f"Oh, what a lovely {analysis.breed}!{comment}\n\n"
-            f"I'd estimate about {analysis.estimated_duration_minutes} minutes for a full groom.\n\n"
-            "Unfortunately, we're completely booked for the next couple of weeks 😔 "
-            "Send me another photo anytime and I'll check again!"
+            f"{ai_response}\n\n"
+            "Unfortunately, we're fully booked for the next two weeks! 😔 "
+            "Feel free to check back soon or give us a call to join the waitlist."
         )
 
-    # Update session
+    # Update session with booking info
     update_session(
         phone,
         state=UserState.AWAITING_CONFIRMATION,
@@ -540,45 +664,29 @@ async def handle_image(phone: str, media_url: str) -> str:
         proposed_slot=slot
     )
 
-    # Calculate price
-    prices = {"Small": 50, "Medium": 70, "Large": 90}
-    price = prices[analysis.size]
-    extra = 0
-    if "matted" in analysis.coat_condition.lower():
-        extra = 20
-        price += extra
-
+    # Append slot info to Gemini's response if not already mentioned
     date_str = slot.strftime("%A, %d %B")
     time_str = slot.strftime("%I:%M %p")
 
-    # Build friendly response
-    comment = analysis.friendly_comment if analysis.friendly_comment else f"What a beautiful {analysis.breed}!"
+    # Check if response already mentions a specific time
+    if "slot" not in ai_response.lower() and "available" not in ai_response.lower():
+        ai_response += f"\n\nI have an opening on *{date_str}* at *{time_str}* - would that work for you? Just reply *Yes* to book or *No* to pass!"
+    else:
+        # Replace placeholder slot mention with actual slot
+        ai_response += f"\n\nReply *Yes* to confirm *{date_str}* at *{time_str}*, or *No* if that doesn't work!"
 
-    price_note = f"${price}"
-    if extra:
-        price_note = f"${price} (includes ${extra} for coat care)"
-
-    return (
-        f"{comment}\n\n"
-        f"Here's what I'm thinking:\n"
-        f"• Breed: {analysis.breed}\n"
-        f"• Size: {analysis.size}\n"
-        f"• Coat: {analysis.coat_condition}\n"
-        f"• Time needed: ~{analysis.estimated_duration_minutes} mins\n"
-        f"• Price: {price_note}\n\n"
-        f"I have an opening on *{date_str}* at *{time_str}* - does that work for you?\n\n"
-        "Just reply *Yes* to book it, or *No* if you'd like to pass!"
-    )
+    return ai_response
 
 
-def handle_text(phone: str, text: str) -> str:
-    """Handle incoming text message"""
+async def handle_text(phone: str, text: str) -> str:
+    """Handle incoming text message using Gemini AI"""
     session = get_session(phone)
     text_lower = text.strip().lower()
 
-    # Handle confirmation state
+    # Check if user is confirming/declining a booking
     if session.state == UserState.AWAITING_CONFIRMATION:
-        if text_lower in ["yes", "y", "confirm", "ok", "sure", "yep", "yeah", "book", "book it"]:
+        # Positive confirmations
+        if any(word in text_lower for word in ["yes", "yep", "yeah", "ok", "okay", "sure", "confirm", "book", "sounds good", "let's do it", "perfect"]):
             if session.dog_analysis and session.proposed_slot:
                 booking = BookingDetails(
                     phone=phone,
@@ -592,81 +700,50 @@ def handle_text(phone: str, text: str) -> str:
                 if book_slot(booking):
                     date_str = session.proposed_slot.strftime("%A, %d %B")
                     time_str = session.proposed_slot.strftime("%I:%M %p")
+                    breed = booking.breed
                     reset_session(phone)
 
-                    return (
-                        f"Awesome, you're all set! 🎉\n\n"
-                        f"📅 {date_str}\n"
-                        f"⏰ {time_str}\n"
-                        f"🐕 {booking.breed} grooming session\n\n"
-                        f"Just pop in about 10 minutes early so we can get started on time. "
-                        f"Can't wait to pamper your pup! See you then! 💈"
+                    # Let Gemini generate the confirmation message
+                    context = {
+                        "action": "booking_confirmed",
+                        "date": date_str,
+                        "time": time_str,
+                        "breed": breed
+                    }
+                    return await chat_with_gemini(
+                        f"Customer confirmed booking for their {breed} on {date_str} at {time_str}. Celebrate with them!",
+                        context
                     )
                 else:
                     reset_session(phone)
-                    return (
-                        "Oh no, something went wrong on my end! 😅\n\n"
-                        "Could you try sending the photo again? Or feel free to give us a call directly."
+                    return await chat_with_gemini(
+                        "The booking system had an error. Apologize and ask them to try again.",
+                        {}
                     )
 
             reset_session(phone)
-            return (
-                "Oops, looks like we lost track of our conversation!\n\n"
-                "No worries - just send me a photo of your dog and we'll start fresh 📸"
+            return await chat_with_gemini(
+                "Customer's session expired. Ask them to send a new dog photo.",
+                {}
             )
 
-        elif text_lower in ["no", "n", "cancel", "nope", "nah", "not now", "maybe later"]:
+        # Negative responses
+        elif any(word in text_lower for word in ["no", "nope", "nah", "cancel", "not now", "maybe later", "don't", "cant", "can't"]):
             reset_session(phone)
-            return (
-                "No problem at all! 👍\n\n"
-                "Whenever you're ready, just send me a photo of your furry friend "
-                "and we'll find a time that works better!"
+            return await chat_with_gemini(
+                "Customer declined the booking. Be understanding and invite them to book another time.",
+                {}
             )
 
-        else:
-            return (
-                "Just checking - did you want to book that slot?\n\n"
-                "Reply *Yes* to confirm, or *No* to skip!"
-            )
+    # Build context for Gemini
+    context = {
+        "state": session.state.value if session.state else "IDLE",
+        "dog_analysis": session.dog_analysis,
+        "proposed_slot": session.proposed_slot
+    }
 
-    # Default state - handle general messages
-    greetings = ["hi", "hello", "hey", "hiya", "good morning", "good afternoon", "good evening"]
-    if any(g in text_lower for g in greetings):
-        return (
-            "Hey there! 👋 Welcome to Pawsome Grooming!\n\n"
-            "I'm here to help you book a grooming session for your pup. "
-            "Just snap a photo of your dog and send it over - I'll take care of the rest!\n\n"
-            "I can figure out the breed, estimate how long the session will take, "
-            "and find you the next available slot. Easy peasy! 🐕"
-        )
-
-    if "price" in text_lower or "cost" in text_lower or "how much" in text_lower:
-        return (
-            "Great question! Here's a rough guide:\n\n"
-            "🐕 Small pups (under 10kg): from $50\n"
-            "🐕 Medium dogs (10-25kg): from $70\n"
-            "🐕 Large doggos (25kg+): from $90\n\n"
-            "The exact price depends on coat condition and breed. "
-            "Send me a photo and I'll give you a proper quote!"
-        )
-
-    if "help" in text_lower or "how does" in text_lower or "how do" in text_lower:
-        return (
-            "Happy to help! Here's how this works:\n\n"
-            "1️⃣ Send me a photo of your dog\n"
-            "2️⃣ I'll identify the breed and check the coat\n"
-            "3️⃣ You'll get a price and available time slots\n"
-            "4️⃣ Reply Yes to book - done!\n\n"
-            "It's that simple! Got questions? Call us at +65 1234 5678"
-        )
-
-    if "thank" in text_lower:
-        return "You're welcome! 😊 Have a great day, and give your pup a pat from me! 🐕"
-
-    return (
-        "I'd love to help you book a grooming session!\n\n"
-        "Just send me a photo of your dog and I'll check what slots are available. 📸🐕"
-    )
+    # Let Gemini handle all other conversations
+    return await chat_with_gemini(text, context)
 
 
 # =============================================================================
@@ -762,11 +839,11 @@ async def webhook(
     except ValueError:
         num_media = 0
 
-    # Handle image if present
+    # Handle image if present (Body may contain caption)
     if num_media > 0 and MediaUrl0:
-        response_text = await handle_image(phone, MediaUrl0)
+        response_text = await handle_image(phone, MediaUrl0, caption=Body)
     else:
-        response_text = handle_text(phone, Body)
+        response_text = await handle_text(phone, Body)
 
     # Return TwiML response
     twiml = MessagingResponse()
