@@ -1,0 +1,23 @@
+# Pet Grooming WhatsApp Bot - Twilio Edition
+# Install with: pip install -r requirements.txt
+
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# HTTP Client (for fetching images)
+httpx>=0.26.0
+
+# Twilio WhatsApp
+twilio>=8.10.0
+
+# Google AI (Gemini)
+google-generativeai>=0.3.0
+
+# Google Calendar API
+google-auth>=2.27.0
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.116.0
+
+# Data Validation
+pydantic>=2.5.0
