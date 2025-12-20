@@ -46,7 +46,7 @@ GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 
 # Model Configuration
 # Using Gemini 1.5 Flash as the stable workhorse, or 2.0-flash-exp if available to you
-MODEL_NAME = "gemini-3.0-flash" 
+MODEL_NAME = "gemini-3-flash-preview" 
 
 # Timezone
 SGT = ZoneInfo("Asia/Singapore")
