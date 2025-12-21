@@ -29,7 +29,7 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-3-flash-preview"
 SGT = datetime.now().astimezone().tzinfo # Simple timezone hook
 
 # --- LOGGING SETUP ---
