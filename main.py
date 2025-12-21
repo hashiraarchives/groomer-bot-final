@@ -29,7 +29,7 @@ GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 
 # Model Settings
 # Note: Ensure you have access to gemini-2.0-flash-exp or similar if 3 isn't public yet via API
-MODEL_NAME = "gemini-2.0-flash-exp" 
+MODEL_NAME = "gemini-3-flash-preview" 
 
 # Timezone
 try:
