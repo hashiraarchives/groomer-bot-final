@@ -1,24 +1,8 @@
-# Pet Grooming WhatsApp Bot - Meta Direct Edition
-# Install with: pip install -r requirements.txt
-
-# Web Framework
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
-python-multipart>=0.0.9
-
-# HTTP Clients
-# httpx used for async media downloads
-httpx>=0.26.0
-# requests used for synchronous helper calls (optional but good to have)
-requests>=2.31.0
-
-# Google AI (Gemini)
-google-generativeai>=0.8.3
-
-# Google Calendar API
-google-auth>=2.27.0
-google-auth-oauthlib>=1.2.0
-google-api-python-client>=2.116.0
-
-# Data Validation
-pydantic>=2.5.0
+fastapi
+uvicorn
+requests
+httpx
+google-genai
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
