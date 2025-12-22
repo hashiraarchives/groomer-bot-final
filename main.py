@@ -1,343 +1,203 @@
 import os
 import json
-import logging
-import base64
 import requests
-import httpx
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List
-from zoneinfo import ZoneInfo
-
 from fastapi import FastAPI, Request, Response, BackgroundTasks
-import google.generativeai as genai
-from google.oauth2 import service_account
+import google.genai as genai
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from datetime import datetime, timedelta
 
-# =============================================================================
-# 1. CONFIGURATION
-# =============================================================================
-
-# Meta / WhatsApp Config
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN") # Permanent Token
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+# --- Configuration ---
+# Load secrets from Railway environment variables
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-
-# Google / Gemini Config
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CALENDAR_CREDENTIALS")
 
-# Model Settings
-# Note: Ensure you have access to gemini-2.0-flash-exp or similar if 3 isn't public yet via API
-MODEL_NAME = "gemini-3-flash-preview" 
-
-# Timezone
-try:
-    SGT = ZoneInfo("Asia/Singapore")
-except:
-    # Fallback if system doesn't have IANA database
-    from datetime import timezone
-    SGT = timezone(timedelta(hours=8))
-
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("BellaBot")
-
-# Init Gemini
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
-# =============================================================================
-# 2. MEDIA HANDLER (META VERSION)
-# =============================================================================
-
-async def download_meta_media(media_id: str) -> tuple[Optional[bytes], str]:
-    """
-    Downloads media from WhatsApp Cloud API.
-    Step 1: Get URL from Media ID.
-    Step 2: Download binary data with Auth headers.
-    """
-    if not media_id:
-        return None, ""
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            # 1. Get the Download URL
-            url_endpoint = f"https://graph.facebook.com/v21.0/{media_id}"
-            headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-            
-            resp_url = await client.get(url_endpoint, headers=headers)
-            if resp_url.status_code != 200:
-                logger.error(f"Failed to get media URL: {resp_url.text}")
-                return None, ""
-                
-            media_url = resp_url.json().get("url")
-            mime_type = resp_url.json().get("mime_type")
-            
-            # 2. Download the Binary
-            resp_data = await client.get(media_url, headers=headers)
-            if resp_data.status_code != 200:
-                logger.error(f"Failed to download bytes: {resp_data.status_code}")
-                return None, ""
-                
-            logger.info(f"Downloaded {mime_type} ({len(resp_data.content)} bytes)")
-            return resp_data.content, mime_type
-            
-    except Exception as e:
-        logger.error(f"Media Download Error: {e}")
-        return None, ""
-
-# =============================================================================
-# 3. GOOGLE CALENDAR TOOLS
-# =============================================================================
-
-class CalendarManager:
-    SCOPES = ["https://www.googleapis.com/auth/calendar"]
-
-    def __init__(self):
-        self.service = self._authenticate()
-
-    def _authenticate(self):
-        creds = None
-        try:
-            if GOOGLE_CREDENTIALS_JSON:
-                info = json.loads(GOOGLE_CREDENTIALS_JSON)
-                creds = service_account.Credentials.from_service_account_info(info, scopes=self.SCOPES)
-            
-            if creds:
-                return build("calendar", "v3", credentials=creds)
-        except Exception as e:
-            logger.error(f"Auth Failed: {e}")
-        return None
-
-    def find_next_slot(self, duration_minutes: int = 90) -> str:
-        if not self.service: return "Calendar Unavailable (Check Credentials)"
-        
-        now = datetime.now(SGT)
-        # Search starting from tomorrow 10am
-        start_search = (now + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
-        end_search = start_search + timedelta(days=5)
-
-        try:
-            events_result = self.service.events().list(
-                calendarId=GOOGLE_CALENDAR_ID,
-                timeMin=start_search.isoformat(),
-                timeMax=end_search.isoformat(),
-                singleEvents=True,
-                orderBy='startTime'
-            ).execute()
-        except Exception as e:
-            logger.error(f"Cal API Error: {e}")
-            return "Could not check calendar."
-
-        busy_times = []
-        for e in events_result.get('items', []):
-            start = e['start'].get('dateTime') or e['start'].get('date')
-            end = e['end'].get('dateTime') or e['end'].get('date')
-            busy_times.append((start, end))
-        
-        curr = start_search
-        while curr < end_search:
-            # Skip nights (e.g., Closed after 7 PM)
-            if curr.hour >= 19:
-                curr = (curr + timedelta(days=1)).replace(hour=10, minute=0)
-                continue
-                
-            is_busy = False
-            slot_end = curr + timedelta(minutes=duration_minutes)
-            
-            # Simple Overlap Check
-            # Note: For production, parse ISO strings properly. 
-            # Here assuming standard Google format for simplicity.
-            slot_start_iso = curr.isoformat()
-            slot_end_iso = slot_end.isoformat()
-            
-            for b_start, b_end in busy_times:
-                # Basic string comparison often works for ISO8601 same-timezone
-                # Ideally, use datetime objects for strict comparison
-                if not (slot_end_iso <= b_start or slot_start_iso >= b_end):
-                    is_busy = True
-                    break
-
-            if not is_busy:
-                return f"Available: {curr.strftime('%A, %d %B at %I:%M %p')}. (ISO: {slot_start_iso})"
-            
-            curr += timedelta(minutes=30)
-
-        return "No slots available next 5 days."
-
-    def book_appointment(self, customer_info: str, time_str: str) -> str:
-        if not self.service: return "Calendar Error."
-        try:
-            # Parse ISO (Handling potential Z or offset issues loosely)
-            start_dt = datetime.fromisoformat(time_str)
-        except:
-            return "Error: Please provide date in ISO format (YYYY-MM-DDTHH:MM:SS)"
-            
-        event = {
-            'summary': f"Grooming: {customer_info}",
-            'start': {'dateTime': start_dt.isoformat(), 'timeZone': 'Asia/Singapore'},
-            'end': {'dateTime': (start_dt + timedelta(minutes=90)).isoformat(), 'timeZone': 'Asia/Singapore'},
-        }
-        try:
-            self.service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-            return "Booking Confirmed! ✅"
-        except Exception as e:
-            logger.error(f"Booking Error: {e}")
-            return "Failed to book slot system error."
-
-calendar = CalendarManager()
-
-# --- GEMINI TOOLS DEFINITION ---
-def check_availability(duration: int = 90):
-    """Checks calendar for the next available slot."""
-    return calendar.find_next_slot(duration)
-
-def book_slot(customer_info: str, iso_date: str):
-    """Books a slot. customer_info: Name/Breed. iso_date: Exact ISO format string from check tool."""
-    return calendar.book_appointment(customer_info, iso_date)
-
-tools = [check_availability, book_slot]
-
-# =============================================================================
-# 4. FASTAPI APP & META WEBHOOK
-# =============================================================================
-
+# --- FastAPI App Initialization ---
 app = FastAPI()
 
-# Simple In-Memory History
-sessions: Dict[str, List[Dict]] = {}
+# --- Logging ---
+def log_message(message):
+    """Prints a message with a timestamp for easy debugging."""
+    print(f"[{datetime.now()}] - {message}")
 
-def send_whatsapp_text(to_number: str, text: str):
-    """Helper to send text back to Meta."""
-    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
+# --- Google Calendar Tools ---
+try:
+    creds_info = json.loads(GOOGLE_CREDS_JSON)
+    creds = Credentials.from_authorized_user_info(creds_info)
+    calendar_service = build('calendar', 'v3', credentials=creds)
+    log_message("Successfully loaded Google Calendar credentials.")
+except Exception as e:
+    log_message(f"ERROR: Failed to load Google Calendar credentials: {e}")
+    calendar_service = None
+
+def check_availability(date: str):
+    """
+    Checks available 30-minute slots on a given date.
+    Date format should be 'YYYY-MM-DD'.
+    """
+    if not calendar_service:
+        return "Error: Calendar service is not available."
+    try:
+        log_message(f"Checking availability for date: {date}")
+        day = datetime.strptime(date, '%Y-%m-%d')
+        start_time = day.replace(hour=9, minute=0, second=0, microsecond=0).isoformat() + 'Z'
+        end_time = day.replace(hour=17, minute=0, second=0, microsecond=0).isoformat() + 'Z'
+
+        events_result = calendar_service.events().list(
+            calendarId='primary',
+            timeMin=start_time,
+            timeMax=end_time,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        busy_slots = events_result.get('items', [])
+
+        busy_times = [(datetime.fromisoformat(e['start']['dateTime'][:-1]), datetime.fromisoformat(e['end']['dateTime'][:-1])) for e in busy_slots]
+
+        available_slots = []
+        current_time = day.replace(hour=9, minute=0)
+        while current_time.hour < 17:
+            is_busy = any(start < current_time.replace(tzinfo=None) < end for start, end in busy_times)
+            if not is_busy:
+                available_slots.append(current_time.strftime('%H:%M'))
+            current_time += timedelta(minutes=30)
+        
+        log_message(f"Found available slots: {available_slots}")
+        return f"Available slots on {date}: {', '.join(available_slots) if available_slots else 'None'}"
+    except Exception as e:
+        log_message(f"ERROR in check_availability: {e}")
+        return "Sorry, I couldn't check the calendar. Please provide the date in YYYY-MM-DD format."
+
+def book_slot(date: str, time: str, service: str, customer_name: str):
+    """
+    Books a 30-minute appointment.
+    Date format: 'YYYY-MM-DD', Time format: 'HH:MM'.
+    """
+    if not calendar_service:
+        return "Error: Calendar service is not available."
+    try:
+        log_message(f"Booking slot for {customer_name} on {date} at {time} for {service}")
+        start_dt = datetime.strptime(f"{date} {time}", '%Y-%m-%d %H:%M')
+        end_dt = start_dt + timedelta(minutes=30)
+
+        event = {
+            'summary': f'{service} for {customer_name}',
+            'start': {'dateTime': start_dt.isoformat(), 'timeZone': 'Asia/Singapore'},
+            'end': {'dateTime': end_dt.isoformat(), 'timeZone': 'Asia/Singapore'},
+        }
+        
+        created_event = calendar_service.events().insert(calendarId='primary', body=event).execute()
+        log_message(f"Successfully created event: {created_event.get('htmlLink')}")
+        return f"Booking confirmed for {customer_name} on {date} at {time} for a {service}."
+    except Exception as e:
+        log_message(f"ERROR in book_slot: {e}")
+        return "Sorry, I couldn't book the appointment. Please check the date and time format."
+
+# --- Gemini AI Configuration ---
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Define the system prompt and tools for the model
+SYSTEM_INSTRUCTION = "You are a friendly and efficient receptionist for 'ABC Grooming'. Your goal is to help customers check appointment availability and book services. Use the available tools to interact with the Google Calendar. Today's date is " + datetime.now().strftime('%Y-%m-%d') + "."
+model = genai.GenerativeModel(
+    model_name='gemini-1.5-flash-latest',
+    system_instruction=SYSTEM_INSTRUCTION,
+    tools=[check_availability, book_slot]
+)
+# Start a new chat session
+chat = model.start_chat(enable_automatic_function_calling=True)
+
+# --- WhatsApp Messaging Functions ---
+def send_whatsapp_message(to_number, message_text):
+    """Sends a text message using the WhatsApp Cloud API."""
+    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
-    payload = {
+    data = {
         "messaging_product": "whatsapp",
         "to": to_number,
-        "text": {"body": text}
+        "text": {"body": message_text},
     }
     try:
-        r = requests.post(url, json=payload, headers=headers)
-        if r.status_code not in [200, 201]:
-            logger.error(f"Meta Send Error: {r.text}")
-    except Exception as e:
-        logger.error(f"Meta Network Error: {e}")
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
+        log_message(f"Sent message to {to_number}. Status: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        log_message(f"ERROR sending message to {to_number}: {e}")
 
-async def process_message(data: dict):
-    """
-    Background Task: 
-    1. Parse Meta JSON
-    2. Download Media (if any)
-    3. Query Gemini
-    4. Reply
-    """
+async def process_whatsapp_message(payload: dict):
+    """Processes the incoming message, calls Gemini, and sends a reply."""
     try:
-        entry = data["entry"][0]
-        changes = entry["changes"][0]
-        value = changes["value"]
-        
-        if "messages" not in value:
-            return # Status update or other event
-
-        msg = value["messages"][0]
-        sender = msg["from"]
-        msg_type = msg["type"]
-        
-        logger.info(f"Processing Msg from {sender} | Type: {msg_type}")
-
-        # 1. Prepare Inputs for Gemini
-        user_parts = []
-        
-        # Handle Text
-        if msg_type == "text":
-            user_parts.append(msg["text"]["body"])
-            
-        # Handle Image/Audio
-        elif msg_type in ["image", "audio", "voice"]:
-            # Meta provides an ID, we must fetch the URL then the Blob
-            media_id = msg[msg_type].get("id")
-            media_bytes, mime_type = await download_meta_media(media_id)
-            
-            if media_bytes:
-                b64_data = base64.b64encode(media_bytes).decode('utf-8')
-                user_parts.append({
-                    "inline_data": {
-                        "mime_type": mime_type,
-                        "data": b64_data
-                    }
-                })
-                if msg_type == "audio" or msg_type == "voice":
-                    user_parts.append("This is a user voice note. Listen and reply kindly.")
-                else:
-                    user_parts.append("Analyze this image (pet details?).")
-
-        if not user_parts:
-            logger.warning("No content found to send to AI.")
+        # Extract relevant information
+        value = payload['entry'][0]['changes'][0]['value']
+        if 'messages' not in value:
             return
 
-        # 2. Manage History
-        if sender not in sessions:
-            sessions[sender] = []
+        message_data = value['messages'][0]
+        from_number = message_data['from']
         
-        # 3. Call Gemini
-        model = genai.GenerativeModel(
-            model_name=MODEL_NAME,
-            system_instruction="""You are Bella, the receptionist at ABC Grooming. 
-            - You are friendly, capable, and professional.
-            - You can see images (identify breed/coat) and hear voice notes.
-            - Use tools to CHECK availability first, then BOOK.
-            - If user sends a photo, comment on how cute the dog is.
-            - Keep replies concise for WhatsApp.""",
-            tools=tools
-        )
-        
-        # Re-construct chat object with history
-        chat = model.start_chat(history=sessions[sender], enable_automatic_function_calling=True)
-        
-        response = chat.send_message(user_parts)
-        ai_reply = response.text
+        if message_data['type'] != 'text':
+            send_whatsapp_message(from_number, "I can only process text messages for now, sorry!")
+            return
 
-        # 4. Save to History & Reply
-        # Note: We store text representation of media for history simplicity
-        sessions[sender].append({"role": "user", "parts": ["User sent message/media."]})
-        sessions[sender].append({"role": "model", "parts": [ai_reply]})
+        user_message = message_data['text']['body']
+        log_message(f"Received message from {from_number}: '{user_message}'")
+
+        # Send message to Gemini and get response
+        response = chat.send_message(user_message)
         
-        send_whatsapp_text(sender, ai_reply)
+        # The new gemini-1.5-flash model with automatic function calling handles the loop.
+        # The final response text will be in response.text
+        bot_reply = response.text
+        
+        log_message(f"Gemini response for {from_number}: '{bot_reply}'")
+        send_whatsapp_message(from_number, bot_reply)
 
     except Exception as e:
-        logger.error(f"Logic Error: {e}")
-        # Optional fallback reply
-        # send_whatsapp_text(sender, "Oops, my brain froze. One moment!")
+        log_message(f"ERROR in process_whatsapp_message: {e}")
+        # Optionally send an error message to the user
+        # send_whatsapp_message(from_number, "I'm having some trouble right now. Please try again later.")
 
+
+# --- Webhook Endpoints ---
 @app.get("/meta-webhook")
 async def verify_webhook(request: Request):
-    """Meta Verification Handshake"""
+    """Handles the webhook verification challenge from Meta."""
     mode = request.query_params.get("hub.mode")
     token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
-    
+
     if mode == "subscribe" and token == VERIFY_TOKEN:
+        log_message("Webhook verification successful!")
         return Response(content=challenge, status_code=200)
-    return Response(content="Verification failed", status_code=403)
+    else:
+        log_message("Webhook verification failed!")
+        return Response(status_code=403)
 
 @app.post("/meta-webhook")
-async def webhook_handler(request: Request, background_tasks: BackgroundTasks):
-    """
-    Main Entry Point
-    """
+async def message_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Handles incoming messages from WhatsApp."""
     try:
-        data = await request.json()
-        # Spawn background task to prevent timeout
-        background_tasks.add_task(process_message, data)
-    except Exception as e:
-        logger.error(f"JSON Parse Error: {e}")
+        payload = await request.json()
+        # Log the raw payload for intense debugging if needed
+        # log_message(f"RAW WEBHOOK PAYLOAD: {payload}")
         
-    return Response(content="OK", status_code=200)
+        # Ensure it's a message payload and not a status update
+        if (payload.get('object') == 'whatsapp_business_account' and 
+            'messages' in payload['entry'][0]['changes'][0]['value']):
+            
+            background_tasks.add_task(process_whatsapp_message, payload)
+        
+        return Response(status_code=200)
+    except Exception as e:
+        log_message(f"ERROR processing POST request: {e}")
+        return Response(status_code=500)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+@app.get("/")
+async def root():
+    return {"status": "ok"}
+
