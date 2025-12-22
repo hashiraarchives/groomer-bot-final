@@ -313,7 +313,7 @@ async def process_message(data: dict):
         # Optional fallback reply
         # send_whatsapp_text(sender, "Oops, my brain froze. One moment!")
 
-@app.get("/webhook")
+@app.get("/meta-webhook")
 async def verify_webhook(request: Request):
     """Meta Verification Handshake"""
     mode = request.query_params.get("hub.mode")
@@ -324,7 +324,7 @@ async def verify_webhook(request: Request):
         return Response(content=challenge, status_code=200)
     return Response(content="Verification failed", status_code=403)
 
-@app.post("/webhook")
+@app.post("/meta-webhook")
 async def webhook_handler(request: Request, background_tasks: BackgroundTasks):
     """
     Main Entry Point
